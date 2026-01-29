@@ -1,1 +1,192 @@
+import numpy as np
+import pandas as pd
+from sklearn.linear_model import RidgeCV
+from sklearn.preprocessing import StandardScaler
+import matplotlib.pyplot as plt
+from sklearn.linear_model import LinearRegression, Ridge
 
+# 1. 数据加载 (沿用你的 300059 或其他数据)
+def load_and_clean_data(filepath):
+    df = pd.read_excel(filepath)
+    # 针对你的 600489.xlsx 格式
+    df.drop([0,1], inplace=True)
+    df.drop(columns=['Stkcd'], inplace=True)
+    df['date'] = pd.to_datetime(df['Trddt'])
+    df.set_index('date', inplace=True)
+    df.drop(columns=['Trddt'], inplace=True)
+    df.columns = ['open','high','low','close','volume']
+    df = df.astype(float) # 确保全是数字
+    df.sort_index(inplace=True)
+    return df
+
+df = load_and_clean_data(filepath= r'C:\Users\MSI\Desktop\300059_5y.xlsx')
+# ====================================================
+# 2. 硬核因子计算 (Mathematical Factors)
+# ====================================================
+
+# 2.1 偏度因子 (Skewness)
+# 逻辑：过去 20 天收益率分布的偏度
+df['Ret'] = df['close'].pct_change()
+df['Factor_Skew'] = df['Ret'].rolling(window=20).skew()
+
+# 2.2 变异系数倒数 (Sharpe Momentum)
+# 逻辑：均值 / 标准差 (越高越好，代表稳稳的幸福)
+# 为了防止除以0，加一个极小值 eps
+#  roll_mean = df['Ret'].rolling(window=20).mean()
+#  roll_std = df['Ret'].rolling(window=20).std()
+#   df['Factor_Sharpe'] = roll_mean / (roll_std + 1e-9)
+
+
+
+
+# =========================================================
+    # 新增：R2_Momentum (路径调整动量) - 工业级向量化实现
+    # =========================================================
+    
+    # 1. 构造辅助变量 Time (自变量 X)
+    # 生成一个 0, 1, 2... 的自然数序列，代表时间流逝
+time_idx = pd.Series(np.arange(len(df)), index=df.index)
+    
+    # 2. 预处理 Price (因变量 Y)
+    # 取对数是必须的，因为股价是复利增长，取 Log 后才是线性增长，回归才有效
+log_price = np.log(df['close'])
+    
+    # 3. 计算滚动相关系数 (Correlation)
+    # 这一步计算 Price 和 Time 的线性相关度
+    # window=20 是常用的短期动量窗口，也可以设为 60 或 90
+roll_corr = log_price.rolling(window=20).corr(time_idx)
+    
+    # 4. 计算带方向的 R2 因子
+    # R2 = Corr^2。
+    # 但 R2 本身没有方向（0~1），我们需要把方向（Sign）乘回去
+    # 结果范围：-1.0 (稳健下跌) <--> 0 (震荡/噪音) <--> +1.0 (稳健上涨)
+df['Factor_R2_Mom'] = (roll_corr ** 2) * np.sign(roll_corr)
+
+
+
+# 2.3 阿米胡德非流动性 (Amihud Illiquidity)
+# 逻辑：绝对收益 / 成交金额 (注意：Excel里的Volume通常是股数，要乘以价格估算金额)
+# 金额 = Volume * Close
+amt = df['volume'] * df['close']
+df['Factor_Amihud'] = df['Ret'].abs() / (amt + 1e-9)
+# 因为数值通常极小，取对数使其分布更正态化
+df['Factor_Amihud'] = np.log(df['Factor_Amihud'] + 1e-9)
+data = df.dropna()
+
+# 2.4 赫斯特指数 (Hurst Exponent) - 简化版 Rolling Hurst
+# 这是一个计算复杂度较高的因子，我们用标准差的比率来近似 (Efficiency Ratio)
+# 严格的 R/S 计算太慢，不适合 Rolling。
+# 近似逻辑：如果价格是随机游走，Var(T) ~ T * Var(1)
+# 也就是：长期波动率 应该是 短期波动率 的 sqrt(T) 倍
+def rolling_hurst_proxy(series, window=100):
+    # 计算 N 天的对数收益
+    rets = np.log(series / series.shift(1))
+    
+    # 作为一个简单的各种 Hurst 近似，我们用 (High-Low) / Volatility 的思路
+    # 或者用更简单的：分形维数代理
+    # 这里用一种极简代理：Efficiency Ratio (Kaufman)
+    # ER = (总位移) / (总路程)
+    # ER 越接近 1，趋势越强 (Hurst > 0.5)
+    # ER 越接近 0，噪音越大 (Hurst < 0.5)
+    
+    change = (series - series.shift(window)).abs() # 总位移
+    path = series.diff().abs().rolling(window=window).sum() # 总路程
+    return change / (path + 1e-9)
+
+data['Factor_Hurst_Proxy'] = rolling_hurst_proxy(df['close'], window=20)
+
+
+
+# 5，GK波动率公式：利用 OHLC 信息，比单纯用 Close 效率高8倍
+c1 = 0.5 * np.log(data['high'] / data['low']) ** 2
+c2 = (2 * np.log(2) - 1) * np.log(data['close'] / data['open']) ** 2
+data['GK_Vol'] = (c1 - c2).rolling(20).mean() # 取20日平均
+
+
+
+# 6. 量价因子 (Volume-Price)
+    # --------------------------------------------------------
+    # (1) 量价相关性 (PV_Corr)
+    # 过去20天，价格涨跌幅 和 成交量变化率 的相关系数
+pct_price = data['close'].pct_change()
+pct_vol = data['volume'].pct_change()
+data['PV_Corr'] = pct_price.rolling(20).corr(pct_vol)
+    
+    # (2) 换手率变动 (Turnover Change) - 近似
+    # 假设流通股本不变，用 Volume / MA(Volume) 代替
+vol_ma20 = data['volume'].rolling(20).mean()
+data['Vol_Ratio'] = data['volume'] / (vol_ma20 + 1e-9)
+
+
+
+
+
+
+
+
+
+# ====================================================
+# 3. 标签与清洗
+# ====================================================
+data['Next_Ret'] = df['close'].pct_change().shift(-1)
+data.dropna(inplace=True)
+
+# ====================================================
+# 4. 线性模型验证 (Ridge) - 看看这些数理因子是否有 IC
+# ====================================================
+feature_cols = ['Factor_Skew', 'Factor_R2_Mom', 'Factor_Amihud', 'Factor_Hurst_Proxy', 'GK_Vol' ,'Vol_Ratio']
+X = data[feature_cols]
+y = data['Next_Ret']
+
+# 训练集/测试集
+split = int(len(X) * 0.8)
+X_train, X_test = X.iloc[:split], X.iloc[split:]
+y_train, y_test = y.iloc[:split], y.iloc[split:]
+
+# 标准化 (非常重要，因为 Amihud 和 Skew 量级完全不同)
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled = scaler.transform(X_test)
+
+# 训练 (去截距，逼迫因子起作用)
+model = Ridge(alpha=1.0, fit_intercept=False)
+model.fit(X_train_scaled, y_train)
+
+# ====================================================
+# 5. 结果分析
+# ====================================================
+print("因子系数 (Coefficients):")
+# 排序看哪个因子最强
+coef_series = pd.Series(model.coef_, index=feature_cols).sort_values(ascending=False)
+print(coef_series)
+
+# 预测
+y_pred = model.predict(X_test_scaled)
+
+# 计算 Rank IC
+rank_ic = pd.Series(y_pred).corr(pd.Series(y_test.values), method='spearman')
+print(f"\nRank IC (OOS): {rank_ic:.4f}")
+
+# 画个图看看累积收益
+
+data_test = data.iloc[split:].copy()
+data_test['Pred'] = y_pred
+
+# 策略信号：预测涨就买，预测跌就空仓
+data_test['Position'] = np.where(data_test['Pred'] < 0, 1, 0)
+# 策略收益 = 仓位 * 真实收益
+data_test['Strategy_Ret'] = data_test['Position'] * data_test['Next_Ret']
+
+# 计算累积净值
+data_test['Cum_Benchmark'] = (1 + data_test['Next_Ret']).cumprod()
+data_test['Cum_Strategy'] = (1 + data_test['Strategy_Ret']).cumprod()
+
+
+
+plt.figure(figsize=(10, 5))
+plt.plot(data_test['Cum_Benchmark'], label='Benchmark', color='grey', alpha=0.5)
+plt.plot(data_test['Cum_Strategy'], label='Math Factors Strategy', color='blue')
+plt.title(f'Math Factors Backtest (Rank IC: {rank_ic:.4f})')
+plt.legend()
+plt.grid()
+plt.show()
