@@ -3,7 +3,7 @@ ML ensemble backtest using user's data cleaning and A-share helpers.
  - Keeps `read_excell_csmar`, `AShareSizer`, `AShareCommission` exactly as requested.
  - Builds a broad factor set, runs model training (RF + XGBoost stacked), selects important factors,
    predicts next-period returns, converts predictions to signals and backtests with Backtrader.
- - Produces performance metrics (Sharpe, IC) and visualizations saved to Desktop.
+ - Produces performance metrics (Sharpe, IC) and visualizations.
 
 Usage example (Windows-friendly, use forward slashes or raw string to avoid escape issues):
 
