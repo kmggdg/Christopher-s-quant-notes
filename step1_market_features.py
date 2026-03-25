@@ -1,0 +1,88 @@
+"""
+Step 1: 大盘截面因子构建 (极简版 - 分批计算)
+- 分日期计算截面均值，避免内存溢出
+"""
+import polars as pl
+import gc
+import os
+import numpy as np
+
+print("=" * 60)
+print("Step 1: 大盘截面因子构建 (极简版)")
+print("=" * 60)
+
+DATA_DIR = r"D:\kaggle日内数据"
+TRAIN_PATH = os.path.join(DATA_DIR, "train.parquet")
+OUTPUT_PATH = os.path.join(DATA_DIR, "market_means.parquet")
+
+# 定义特征列
+f_cols = [f"f{i}" for i in range(384)]
+
+# 1. 首先获取日期范围
+print("\n[1/4] 获取日期范围...")
+df_schema = pl.scan_parquet(TRAIN_PATH).select(["dateid"]).collect()
+max_dateid = int(df_schema["dateid"].max())
+min_dateid = int(df_schema["dateid"].min())
+print(f"  dateid范围: {min_dateid} - {max_dateid}")
+del df_schema
+gc.collect()
+
+# 2. 分日期计算截面均值
+print("\n[2/4] 分日期计算截面均值...")
+
+# 每10天为一个批次
+batch_size = 10
+market_means_list = []
+
+for start_date in range(0, max_dateid + 1, batch_size):
+    end_date = min(start_date + batch_size, max_dateid + 1)
+
+    # 读取当前批次的原始数据
+    batch_data = (
+        pl.scan_parquet(TRAIN_PATH)
+        .filter(pl.col("timeid") < 229)
+        .filter((pl.col("dateid") >= start_date) & (pl.col("dateid") < end_date))
+        .select(["dateid", "timeid"] + f_cols + ["LabelA"])
+        .collect()
+    )
+
+    # 转换为Float32
+    batch_data = batch_data.with_columns([
+        pl.col(c).cast(pl.Float32) for c in f_cols + ["LabelA"]
+    ])
+
+    # 按dateid, timeid分组计算均值
+    mean_exprs = [pl.col(f).mean().alias(f"{f}_market_mean") for f in f_cols]
+    mean_exprs.append(pl.col("LabelA").mean().alias("LabelA_market_mean"))
+
+    batch_means = batch_data.group_by(["dateid", "timeid"]).agg(mean_exprs)
+    market_means_list.append(batch_means)
+
+    print(f"  已处理 dateid {start_date} - {end_date-1}")
+
+    del batch_data
+    gc.collect()
+
+# 3. 合并所有批次
+print("\n[3/4] 合并所有批次...")
+market_df = pl.concat(market_means_list)
+del market_means_list
+gc.collect()
+
+print(f"  合并后形状: {market_df.shape}")
+
+# 4. 保存
+print("\n[4/4] 保存结果...")
+market_df.write_parquet(OUTPUT_PATH)
+print(f"输出文件: {OUTPUT_PATH}")
+
+# 预览
+print("\n数据预览:")
+print(market_df.head())
+
+del market_df
+gc.collect()
+
+print("\n" + "=" * 60)
+print("Step 1 完成!")
+print("=" * 60)
